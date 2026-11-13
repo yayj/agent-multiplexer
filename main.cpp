@@ -1,8 +1,27 @@
+#include <boost/asio.hpp>
 #include <boost/program_options.hpp>
+#include <filesystem>
 #include <iostream>
+#include <ranges>
 #include <string>
 
-namespace opts = boost::program_options;
+namespace asio   = boost::asio;
+namespace fs     = std::filesystem;
+namespace opts   = boost::program_options;
+namespace ranges = std::ranges;
+namespace views  = std::views;
+
+static void daemonize(std::string_view pid, std::string_view log)
+{
+  // To be done.
+}
+
+template <asio::execution::executor Executor, ranges::range Dirs>
+asio::awaitable<void> run(Executor ex, Dirs&& dirs, fs::path const& fe)
+{
+  // To be done.
+  co_return;
+}
 
 int main(int argc, char* argv[])
 {
@@ -46,6 +65,13 @@ int main(int argc, char* argv[])
     std::cout << desc;
     return 1;
   }
+
+  if (args.count("daemon")) daemonize(pid, log);
+
+  auto ctx = asio::io_context{};
+  asio::co_spawn(ctx, run(ctx.get_executor(), be | views::split(','), fe), asio::detached);
+
+  ctx.run();
 
   return 0;
 }
