@@ -4,6 +4,8 @@
 #include <iostream>
 #include <ranges>
 #include <string>
+#include <string_view>
+#include <system_error>
 
 namespace asio   = boost::asio;
 namespace fs     = std::filesystem;
@@ -11,24 +13,51 @@ namespace opts   = boost::program_options;
 namespace ranges = std::ranges;
 namespace views  = std::views;
 
+using stream = asio::local::stream_protocol;
+
 static void daemonize(std::string_view pid, std::string_view log)
 {
   // To be done.
 }
 
-template <asio::execution::executor Executor, ranges::range Dirs>
-asio::awaitable<void> run(Executor ex, Dirs&& dirs, fs::path const& fe)
+static std::string replace_home(std::string_view orig)
+{
+  assert(!ranges::empty(orig));
+  if (orig[0] != '~') return std::format("{}", orig);
+  static auto home = std::string_view{::getenv("HOME")};
+  return std::format("{}{}", home, orig.substr(1));
+}
+
+static asio::awaitable<void> do_session(stream::socket in)
 {
   // To be done.
   co_return;
 }
 
+template <asio::execution::executor Executor, ranges::range Dirs>
+asio::awaitable<void> run(Executor ex, Dirs&& dirs, stream::acceptor fe)
+{
+  while (true)
+    asio::co_spawn(ex, do_session(co_await fe.async_accept(asio::use_awaitable)), asio::detached);
+}
+
+static void prepare_directory(std::string_view fn)
+{
+  auto path = fs::path{fn};
+  if (fs::exists(path))
+    throw std::system_error{
+        std::make_error_code(std::errc::file_exists),
+        std::format("{} exists", fn)
+    };
+  if (!fs::exists(path.parent_path())) fs::create_directories(path.parent_path());
+}
+
 int main(int argc, char* argv[])
 {
-  auto be  = std::string{};
-  auto fe  = std::string{};
-  auto log = std::string{};
-  auto pid = std::string{};
+  auto dirs = std::string{};
+  auto fn   = std::string{};
+  auto log  = std::string{};
+  auto pid  = std::string{};
 
   // clang-format off
   auto desc = opts::options_description{"Available options"};
@@ -36,13 +65,13 @@ int main(int argc, char* argv[])
     ("help,h", "Produce help message")
     (
      "backend,b",
-     opts::value<std::string>(&be)->default_value("~/.ssh/agent,/tmp"),
+     opts::value<std::string>(&dirs)->default_value("~/.ssh/agent,/tmp"),
      "Directories of back-end agents, separated by commas"
-     )
+    )
     ("daemon,d", "Daemonize")
     (
      "frontend,f",
-     opts::value<std::string>(&fe)->default_value("~/.ssh/agent.sock"),
+     opts::value<std::string>(&fn)->default_value("~/.ssh/agent.sock"),
      "Fixed socket to accept connections"
     )
     (
@@ -66,10 +95,23 @@ int main(int argc, char* argv[])
     return 1;
   }
 
+  if (ranges::empty(fn)) fn = "~/.ssh/agent.sock";
+  fn = replace_home(fn);
+
+  prepare_directory(fn);
+
   if (args.count("daemon")) daemonize(pid, log);
 
   auto ctx = asio::io_context{};
-  asio::co_spawn(ctx, run(ctx.get_executor(), be | views::split(','), fe), asio::detached);
+  auto ex  = ctx.get_executor();
+  asio::co_spawn(
+      ex,
+      run(ex,
+          dirs | views::split(',') |
+              views::filter([](auto&& item) { return !ranges::empty(item); }),
+          stream::acceptor{ex, fn}),
+      asio::detached
+  );
 
   ctx.run();
 
