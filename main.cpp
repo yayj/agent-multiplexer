@@ -1,18 +1,20 @@
+#include <bit>
 #include <boost/asio.hpp>
 #include <boost/program_options.hpp>
 #include <filesystem>
 #include <iostream>
-#include <ranges>
+#include <range/v3/all.hpp>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 
-namespace asio   = boost::asio;
-namespace fs     = std::filesystem;
-namespace opts   = boost::program_options;
-namespace ranges = std::ranges;
-namespace views  = std::views;
+namespace asio  = boost::asio;
+namespace fs    = std::filesystem;
+namespace opts  = boost::program_options;
+namespace views = ranges::views;
 
+using namespace std::literals;
 using stream = asio::local::stream_protocol;
 
 static void daemonize(std::string_view pid, std::string_view log)
@@ -26,6 +28,55 @@ static std::string replace_home(std::string_view orig)
   if (orig[0] != '~') return std::format("{}", orig);
   static auto home = std::string_view{::getenv("HOME")};
   return std::format("{}{}", home, orig.substr(1));
+}
+
+template <std::integral Int> asio::awaitable<Int> read_int(stream::socket& s)
+{
+  auto ret = Int{};
+  co_await asio::async_read(
+      s,
+      asio::buffer(reinterpret_cast<char*>(&ret), sizeof(Int)),
+      asio::use_awaitable
+  );
+  co_return std::byteswap(ret);
+}
+
+static asio::awaitable<size_t> read_chunk(stream::socket& s, std::span<char> b)
+{
+  auto len = co_await read_int<uint32_t>(s);
+  if (ranges::size(b) < len + sizeof(uint32_t))
+    throw std::range_error{"Buffer size is insufficient"};
+  ranges::copy(
+      views::counted(reinterpret_cast<char const*>(&len), sizeof(uint32_t)) | views::reverse,
+      ranges::begin(b)
+  );
+  co_await asio::async_read(s, asio::buffer(b.subspan(sizeof(uint32_t)), len), asio::use_awaitable);
+  co_return len + sizeof(uint32_t);
+}
+
+static asio::awaitable<std::string> read_id(stream::socket& s)
+{
+  auto ret = std::string(1024, 0);
+  auto len = co_await read_chunk(s, ret);
+  len += co_await read_chunk(s, std::span{ret}.subspan(len));
+  ret.resize(len);
+  co_return ret;
+}
+
+static asio::awaitable<std::vector<std::string>>
+    request_ids(stream::socket s, stream::endpoint agent)
+{
+  co_await s.async_connect(agent, asio::use_awaitable);
+  co_await asio::async_write(s, asio::buffer("\x00\x00\x00\x01\x0b"sv), asio::use_awaitable);
+
+  co_await read_int<uint32_t>(s);
+  if (co_await read_int<uint8_t>(s) != 0x0c)
+    throw std::invalid_argument{"Invalid response from agent"};
+
+  auto ret = std::vector<std::string>{};
+  for (auto i = co_await read_int<uint32_t>(s); i > 0; --i) ret.emplace_back(co_await read_id(s));
+
+  co_return ret;
 }
 
 static asio::awaitable<void> do_session(stream::socket in)
