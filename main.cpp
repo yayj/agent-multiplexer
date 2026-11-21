@@ -77,16 +77,16 @@ static asio::awaitable<size_t> read_chunk(stream::socket& s, std::span<char> b)
   co_return len + sizeof(uint32_t);
 }
 
-static asio::awaitable<std::string> read_id(stream::socket& s)
+static asio::awaitable<std::pair<std::string, std::string>> read_id(stream::socket& s)
 {
-  auto ret = std::string(1024, 0);
-  auto len = co_await read_chunk(s, ret);
-  len += co_await read_chunk(s, std::span{ret}.subspan(len));
-  ret.resize(len);
-  co_return ret;
+  auto identity = std::string(1024, 0);
+  identity.resize(co_await read_chunk(s, identity));
+  auto comment = std::string(1024, 0);
+  comment.resize(co_await read_chunk(s, comment));
+  co_return std::make_pair(std::move(identity), std::move(comment));
 }
 
-static asio::awaitable<std::vector<std::string>>
+static asio::awaitable<std::unordered_map<std::string, std::string>>
     request_ids(stream::socket s, stream::endpoint agent)
 {
   co_await s.async_connect(agent, asio::use_awaitable);
@@ -96,8 +96,8 @@ static asio::awaitable<std::vector<std::string>>
   if (co_await read_int<uint8_t>(s) != 0x0c)
     throw std::invalid_argument{"Invalid response from agent"};
 
-  auto ret = std::vector<std::string>{};
-  for (auto i = co_await read_int<uint32_t>(s); i > 0; --i) ret.emplace_back(co_await read_id(s));
+  auto ret = std::unordered_map<std::string, std::string>{};
+  for (auto i = co_await read_int<uint32_t>(s); i > 0; --i) ret.emplace(co_await read_id(s));
 
   co_return ret;
 }
@@ -149,15 +149,18 @@ public:
       )
                                          .async_wait(wait_for_one(), asio::use_awaitable);
 
-      auto data = views::zip(eptrs, rs | views::move, agents) |
-                  views::filter([](auto&& item) { return std::get<0>(item) == nullptr; }) |
-                  views::transform([](auto&& item) {
-                    return std::get<1>(item) | views::move |
-                           views::transform([v = std::get<2>(item)](auto&& k) {
-                             return std::make_pair(std::move(k), v);
-                           });
-                  }) |
-                  views::join | ranges::to<std::unordered_map<std::string, std::string>>();
+      auto data =
+          views::zip(eptrs, rs | views::move, agents) |
+          views::filter([](auto&& item) { return std::get<0>(item) == nullptr; }) |
+          views::transform([](auto&& item) {
+            return std::get<1>(item) | views::move |
+                   views::transform([fn = std::get<2>(item)](auto&& k) {
+                     auto [id, comment] = std::move(k);
+                     return std::make_pair(std::move(id), std::make_pair(std::move(comment), fn));
+                   });
+          }) |
+          views::join |
+          ranges::to<std::unordered_map<std::string, std::pair<std::string, std::string>>>();
 
       co_await asio::post(asio::bind_executor(strand_, asio::use_awaitable));
       std::swap(data, data_);
@@ -172,10 +175,13 @@ public:
     co_await asio::post(asio::bind_executor(strand_, asio::use_awaitable));
 
     auto ret = ranges::fold_left(
-        data_ | views::keys,
+        data_ | views::transform([](auto&& pair) {
+          return std::format("{}{}", pair.first, pair.second.first);
+        }),
         std::string(1 + 2 * sizeof(uint32_t), 0),
         [](auto acc, auto&& id) { return acc.append(id); }
     );
+
     auto it = ranges::begin(ret);
     write_int<uint32_t>(ranges::size(ret) - 4, it);
     write_int<char>(0x0c, it);
@@ -185,8 +191,8 @@ public:
   }
 
 private:
-  asio::strand<asio::any_io_executor>          strand_;
-  std::unordered_map<std::string, std::string> data_;
+  asio::strand<asio::any_io_executor>                                  strand_;
+  std::unordered_map<std::string, std::pair<std::string, std::string>> data_;
 };
 
 static asio::awaitable<void> do_session(stream::socket in, Backend& be)
