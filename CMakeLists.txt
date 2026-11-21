@@ -11,7 +11,7 @@ set(multiplexer am)
 add_executable(${multiplexer} main.cpp)
 target_compile_definitions(${multiplexer} PRIVATE META_NO_STD_FORWARD_DECLARATIONS)
 set_target_properties(${multiplexer} PROPERTIES
-  CXX_STANDARD 20
+  CXX_STANDARD 23
   CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF)
 target_link_libraries(${multiplexer} PRIVATE

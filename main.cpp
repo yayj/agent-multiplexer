@@ -1,13 +1,16 @@
 #include <bit>
 #include <boost/asio.hpp>
+#include <boost/asio/experimental/parallel_group.hpp>
 #include <boost/program_options.hpp>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <range/v3/all.hpp>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 
 namespace asio  = boost::asio;
 namespace fs    = std::filesystem;
@@ -15,11 +18,22 @@ namespace opts  = boost::program_options;
 namespace views = ranges::views;
 
 using namespace std::literals;
+
 using stream = asio::local::stream_protocol;
+using asio::experimental::make_parallel_group;
+using asio::experimental::wait_for_all;
+using asio::experimental::wait_for_one;
 
 static void daemonize(std::string_view pid, std::string_view log)
 {
   // To be done.
+}
+
+static bool belongs_to_me(fs::path const& location)
+{
+  using Stat = struct ::stat;
+  auto fst   = Stat{};
+  return ::stat(location.c_str(), &fst) == 0 && fst.st_uid == ::getuid();
 }
 
 static std::string replace_home(std::string_view orig)
@@ -28,6 +42,15 @@ static std::string replace_home(std::string_view orig)
   if (orig[0] != '~') return std::format("{}", orig);
   static auto home = std::string_view{::getenv("HOME")};
   return std::format("{}{}", home, orig.substr(1));
+}
+
+template <std::integral Int, std::output_iterator<char> Iter> void write_int(Int data, Iter& it)
+{
+  ranges::copy(
+      views::counted(reinterpret_cast<char const*>(&data), sizeof(Int)) | views::reverse,
+      it
+  );
+  std::advance(it, sizeof(Int));
 }
 
 template <std::integral Int> asio::awaitable<Int> read_int(stream::socket& s)
@@ -79,17 +102,127 @@ static asio::awaitable<std::vector<std::string>>
   co_return ret;
 }
 
-static asio::awaitable<void> do_session(stream::socket in)
+class Backend {
+public:
+  template <asio::execution::executor Executor>
+  Backend(Executor ex) : strand_{asio::make_strand(ex)}
+  {
+  }
+
+  asio::awaitable<void> start(std::string_view names)
+  {
+    auto ex    = strand_.get_inner_executor();
+    auto timer = asio::system_timer{ex};
+    auto paths = names | views::split(',') |
+                 views::filter([](auto&& piece) { return !ranges::empty(piece); }) |
+                 views::transform([](auto&& piece) {
+                   return std::string_view{
+                       std::addressof(*ranges::begin(piece)),
+                       static_cast<size_t>(ranges::distance(piece))
+                   };
+                 }) |
+                 views::transform([](auto&& name) { return fs::path{replace_home(name)}; });
+    while (true) {
+      auto subs = paths | views::filter([](auto&& p) { return fs::is_directory(p); }) |
+                  views::transform([](auto&& p) {
+                    return fs::recursive_directory_iterator{
+                        p,
+                        fs::directory_options::skip_permission_denied
+                    };
+                  }) |
+                  views::join | views::transform([](auto&& entry) { return entry.path(); });
+      auto agents = views::concat(subs, paths) |
+                    views::filter([](auto&& p) { return fs::is_socket(p) && belongs_to_me(p); }) |
+                    views::transform([](auto&& p) { return p.string(); });
+      auto tasks =
+          make_parallel_group(ranges::to<std::vector>(agents | views::transform([=](auto&& name) {
+                                                        return asio::co_spawn(
+                                                            ex,
+                                                            request_ids(stream::socket{ex}, name),
+                                                            asio::deferred
+                                                        );
+                                                      })));
+      timer.expires_after(1s);
+      auto [oo, io, eptrs, rs, ec] = co_await make_parallel_group(
+                                         tasks.async_wait(wait_for_all(), asio::deferred),
+                                         timer.async_wait(asio::deferred)
+      )
+                                         .async_wait(wait_for_one(), asio::use_awaitable);
+
+      auto data = views::zip(eptrs, rs | views::move, agents) |
+                  views::filter([](auto&& item) { return std::get<0>(item) == nullptr; }) |
+                  views::transform([](auto&& item) {
+                    return std::get<1>(item) | views::move |
+                           views::transform([v = std::get<2>(item)](auto&& k) {
+                             return std::make_pair(std::move(k), v);
+                           });
+                  }) |
+                  views::join | ranges::to<std::unordered_map<std::string, std::string>>();
+
+      co_await asio::post(asio::bind_executor(strand_, asio::use_awaitable));
+      std::swap(data, data_);
+
+      timer.expires_after(10s);
+      co_await timer.async_wait(asio::use_awaitable);
+    }
+  }
+
+  asio::awaitable<std::string> list()
+  {
+    co_await asio::post(asio::bind_executor(strand_, asio::use_awaitable));
+
+    auto ret = ranges::fold_left(
+        data_ | views::keys,
+        std::string(1 + 2 * sizeof(uint32_t), 0),
+        [](auto acc, auto&& id) { return acc.append(id); }
+    );
+    auto it = ranges::begin(ret);
+    write_int<uint32_t>(ranges::size(ret) - 4, it);
+    write_int<char>(0x0c, it);
+    write_int<uint32_t>(ranges::size(data_), it);
+
+    co_return ret;
+  }
+
+private:
+  asio::strand<asio::any_io_executor>          strand_;
+  std::unordered_map<std::string, std::string> data_;
+};
+
+static asio::awaitable<void> do_session(stream::socket in, Backend& be)
 {
-  // To be done.
-  co_return;
+  auto len  = co_await read_int<uint32_t>(in);
+  auto code = co_await read_int<uint8_t>(in);
+  switch (code) {
+  case 0x0b:
+    co_await asio::async_write(in, asio::buffer(co_await be.list()), asio::use_awaitable);
+    break;
+  default:
+    std::cout << std::format("Unsupported code: {:02x}\n", code);
+    co_await asio::async_write(in, asio::buffer("\x00\x00\x00\x01\x05"), asio::use_awaitable);
+    break;
+  }
 }
 
-template <asio::execution::executor Executor, ranges::range Dirs>
-asio::awaitable<void> run(Executor ex, Dirs&& dirs, stream::acceptor fe)
+static asio::awaitable<void> run(stream::acceptor fe, Backend& be)
 {
   while (true)
-    asio::co_spawn(ex, do_session(co_await fe.async_accept(asio::use_awaitable)), asio::detached);
+    asio::co_spawn(
+        fe.get_executor(),
+        do_session(co_await fe.async_accept(asio::use_awaitable), be),
+        asio::detached
+    );
+}
+
+template <asio::execution::executor Executor>
+asio::awaitable<void> tear_down(Executor ex, std::string_view fn)
+{
+  auto sig = asio::signal_set{ex};
+  sig.add(SIGTERM);
+  sig.add(SIGINT);
+  co_await sig.async_wait(asio::use_awaitable);
+  fs::remove(fn);
+  exit(1);
 }
 
 static void prepare_directory(std::string_view fn)
@@ -155,14 +288,11 @@ int main(int argc, char* argv[])
 
   auto ctx = asio::io_context{};
   auto ex  = ctx.get_executor();
-  asio::co_spawn(
-      ex,
-      run(ex,
-          dirs | views::split(',') |
-              views::filter([](auto&& item) { return !ranges::empty(item); }),
-          stream::acceptor{ex, fn}),
-      asio::detached
-  );
+
+  auto be = Backend{ex};
+  asio::co_spawn(ex, be.start(dirs), asio::detached);
+  asio::co_spawn(ex, run(stream::acceptor{ex, fn}, be), asio::detached);
+  asio::co_spawn(ex, tear_down(ex, fn), asio::detached);
 
   ctx.run();
 
