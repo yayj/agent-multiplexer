@@ -53,37 +53,25 @@ template <std::integral Int, std::output_iterator<char> Iter> void write_int(Int
   std::advance(it, sizeof(Int));
 }
 
-template <std::integral Int> asio::awaitable<Int> read_int(stream::socket& s)
+static asio::awaitable<std::string> read_message(stream::socket& s, uint32_t max = 1024)
 {
-  auto ret = Int{};
+  auto ret = std::string(max, 0);
+
+  co_await asio::async_read(s, asio::buffer(ret, sizeof(uint32_t)), asio::use_awaitable);
+  auto len = std::byteswap(*reinterpret_cast<uint32_t const*>(ranges::data(ret)));
+  if (len > max - sizeof(uint32_t)) throw std::range_error{"Message is too long"};
   co_await asio::async_read(
       s,
-      asio::buffer(reinterpret_cast<char*>(&ret), sizeof(Int)),
+      asio::buffer(std::span{ret}.subspan(sizeof(uint32_t), len)),
       asio::use_awaitable
   );
-  co_return std::byteswap(ret);
+  ret.resize(len + sizeof(uint32_t));
+  co_return ret;
 }
 
-static asio::awaitable<size_t> read_chunk(stream::socket& s, std::span<char> b)
+static uint32_t parse_len(std::span<char> bytes)
 {
-  auto len = co_await read_int<uint32_t>(s);
-  if (ranges::size(b) < len + sizeof(uint32_t))
-    throw std::range_error{"Buffer size is insufficient"};
-  ranges::copy(
-      views::counted(reinterpret_cast<char const*>(&len), sizeof(uint32_t)) | views::reverse,
-      ranges::begin(b)
-  );
-  co_await asio::async_read(s, asio::buffer(b.subspan(sizeof(uint32_t)), len), asio::use_awaitable);
-  co_return len + sizeof(uint32_t);
-}
-
-static asio::awaitable<std::pair<std::string, std::string>> read_id(stream::socket& s)
-{
-  auto identity = std::string(1024, 0);
-  identity.resize(co_await read_chunk(s, identity));
-  auto comment = std::string(1024, 0);
-  comment.resize(co_await read_chunk(s, comment));
-  co_return std::make_pair(std::move(identity), std::move(comment));
+  return std::byteswap(*reinterpret_cast<uint32_t const*>(ranges::data(bytes)));
 }
 
 static asio::awaitable<std::unordered_map<std::string, std::string>>
@@ -92,12 +80,22 @@ static asio::awaitable<std::unordered_map<std::string, std::string>>
   co_await s.async_connect(agent, asio::use_awaitable);
   co_await asio::async_write(s, asio::buffer("\x00\x00\x00\x01\x0b"sv), asio::use_awaitable);
 
-  co_await read_int<uint32_t>(s);
-  if (co_await read_int<uint8_t>(s) != 0x0c)
-    throw std::invalid_argument{"Invalid response from agent"};
+  auto rep = co_await read_message(s, 2048);
 
-  auto ret = std::unordered_map<std::string, std::string>{};
-  for (auto i = co_await read_int<uint32_t>(s); i > 0; --i) ret.emplace(co_await read_id(s));
+  if (rep[4] != 0x0c) throw std::invalid_argument{"Invalid response from agent"};
+
+  auto ret  = std::unordered_map<std::string, std::string>{};
+  auto body = std::span{rep}.subspan(sizeof(uint32_t) * 2 + sizeof(char));
+  for (auto i = parse_len(std::span{rep}.subspan(sizeof(uint32_t) + sizeof(char))); i > 0; --i) {
+    auto identity = body.subspan(0, sizeof(uint32_t) + parse_len(body));
+    body          = body.subspan(ranges::size(identity));
+    auto comment  = body.subspan(0, sizeof(uint32_t) + parse_len(body));
+    body          = body.subspan(ranges::size(comment));
+    ret.emplace(
+        std::string{ranges::begin(identity), ranges::end(identity)},
+        std::string{ranges::begin(comment), ranges::end(comment)}
+    );
+  }
 
   co_return ret;
 }
@@ -190,23 +188,60 @@ public:
     co_return ret;
   }
 
+  asio::awaitable<std::string> query(std::string const& id)
+  {
+    co_await asio::post(asio::bind_executor(strand_, asio::use_awaitable));
+
+    auto it = data_.find(id);
+    if (it == ranges::end(data_)) {
+      std::cout << "Can't find a id\n";
+      co_return ""s;
+    }
+    std::cout << std::format("Found an available agent: {}\n", it->second.second);
+    co_return it->second.second;
+  }
+
 private:
   asio::strand<asio::any_io_executor>                                  strand_;
   std::unordered_map<std::string, std::pair<std::string, std::string>> data_;
 };
 
+static asio::awaitable<void> handle_sign(stream::socket& s, Backend& be, std::span<char> msg)
+{
+  auto id = msg.subspan(
+      sizeof(uint32_t) + 1,
+      sizeof(uint32_t) + parse_len(msg.subspan(sizeof(uint32_t) + 1))
+  );
+  auto fn = co_await be.query(std::string{ranges::begin(id), ranges::end(id)});
+  if (ranges::empty(fn)) {
+    co_await asio::async_write(s, asio::buffer("\x00\x00\x00\x01\x05"sv), asio::use_awaitable);
+    co_return;
+  }
+
+  auto agent = stream::socket{s.get_executor()};
+  co_await agent.async_connect(fn, asio::use_awaitable);
+  co_await asio::async_write(agent, asio::buffer(msg), asio::use_awaitable);
+
+  co_await asio::async_write(s, asio::buffer(co_await read_message(agent)), asio::use_awaitable);
+}
+
 static asio::awaitable<void> do_session(stream::socket in, Backend& be)
 {
-  auto len  = co_await read_int<uint32_t>(in);
-  auto code = co_await read_int<uint8_t>(in);
-  switch (code) {
-  case 0x0b:
-    co_await asio::async_write(in, asio::buffer(co_await be.list()), asio::use_awaitable);
-    break;
-  default:
-    std::cout << std::format("Unsupported code: {:02x}\n", code);
-    co_await asio::async_write(in, asio::buffer("\x00\x00\x00\x01\x05"), asio::use_awaitable);
-    break;
+  while (in.is_open()) {
+    auto msg  = co_await read_message(in);
+    auto code = msg[4];
+    switch (msg[4]) {
+    case 0x0b:
+      co_await asio::async_write(in, asio::buffer(co_await be.list()), asio::use_awaitable);
+      break;
+    case 0x0d:
+      co_await handle_sign(in, be, msg);
+      break;
+    default:
+      std::cout << std::format("Unsupported code: {:02x}\n", code);
+      co_await asio::async_write(in, asio::buffer("\x00\x00\x00\x01\x05"sv), asio::use_awaitable);
+      break;
+    }
   }
 }
 
